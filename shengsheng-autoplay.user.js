@@ -639,55 +639,135 @@
     waitForNewVideoAndPlay();
   }
 
+  // ============ 获取页面内的 axios 实例 ============
+  function getPageAxios() {
+    const app = document.querySelector("#app");
+    if (app && app.__vue__) {
+      // Vue 组件上挂了 $axios
+      let vm = app.__vue__;
+      if (vm.$axios) return vm.$axios;
+      // 递归找子组件
+      function find(vm) {
+        if (vm.$axios) return vm.$axios;
+        if (vm.$children) {
+          for (const c of vm.$children) {
+            const r = find(c);
+            if (r) return r;
+          }
+        }
+        return null;
+      }
+      return find(vm);
+    }
+    return null;
+  }
+
+  // 封装 API 请求: 优先用页面 axios, 退而求其次用 fetch + credentials
+  async function apiGet(path) {
+    // 方案1: 页面 axios (带完整的 headers、interceptors、cookies)
+    const ax = getPageAxios();
+    if (ax) {
+      try {
+        const resp = await ax.get(path);
+        return resp; // axios 返回的已经是 data (经过 interceptor 处理)
+      } catch (e) {
+        log(`axios 请求失败 (${path}): ${e.message}, 尝试 fetch`, "warn");
+      }
+    }
+
+    // 方案2: fetch + credentials
+    const url = path.startsWith("http")
+      ? path
+      : `https://gateway.shengshengketang.com${path}`;
+    const resp = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        "Origin": "https://www.shengshengketang.com",
+      },
+    });
+    return await resp.json();
+  }
+
   // ============ 跳转到同分类下一门课程 ============
   async function switchToNextCourse() {
     log("正在查找下一门课程...", "warn");
 
     try {
-      // 1. 获取当前课程信息 (从 sessionStorage 拿 currid)
+      // 1. 获取当前课程 ID
       const currid = JSON.parse(sessionStorage.getItem("currid"));
       if (!currid) {
         log("无法获取当前课程 ID", "error");
         finishAll();
         return;
       }
+      log(`当前课程 ID: ${currid}`);
 
       // 2. 获取当前课程详情, 拿到 classifySubId 和 sort
-      const detailResp = await fetch(
-        `https://gateway.shengshengketang.com/api/course/curriculum/tourist/selectDetail/${currid}`,
-        { headers: { "Content-Type": "application/json" } }
-      ).then(r => r.json());
+      let detailData = null;
+      try {
+        const detailResp = await apiGet(
+          `/api/course/curriculum/tourist/selectDetail/${currid}`
+        );
+        // axios interceptor 可能返回 { code, data } 或直接返回 data
+        if (detailResp && detailResp.code === 200) {
+          detailData = detailResp.data;
+        } else if (detailResp && detailResp.data && detailResp.data.code === 200) {
+          detailData = detailResp.data.data;
+        } else {
+          log(`课程详情 API 返回: ${JSON.stringify(detailResp).substring(0, 200)}`, "error");
+        }
+      } catch (e) {
+        log(`课程详情请求异常: ${e.message}`, "error");
+      }
 
-      if (detailResp.code !== 200 || !detailResp.data) {
-        log("获取课程详情失败", "error");
+      if (!detailData) {
+        log("获取课程详情失败, 尝试从页面获取...", "warn");
+        // 备选: 从 Vue 实例上获取 (网站 JS 可能把 courseInfo 存在某个组件上)
+        const vm = getCourseVm();
+        if (vm && vm.currid) {
+          // 至少拿到 currid, 但可能没有 classifySubId
+          // 尝试直接用课程列表 API (不过需要 subClassifyId)
+          log("Vue 实例上没有完整课程信息, 尝试课程列表 API 兜底", "warn");
+          await switchToNextCourseViaListPage();
+          return;
+        }
         finishAll();
         return;
       }
 
-      const currentCourse = detailResp.data;
-      const subClassifyId = currentCourse.classifySubId;
-      const currentSort = parseInt(currentCourse.sort) || 0;
-      log(`当前课程: ${currentCourse.name} (sort=${currentSort}, 分类=${subClassifyId})`);
+      const subClassifyId = detailData.classifySubId;
+      const currentSort = parseInt(detailData.sort) || 0;
+      log(`当前课程: ${detailData.name} (sort=${currentSort}, 分类=${subClassifyId})`);
 
       if (!subClassifyId) {
-        log("当前课程没有分类信息, 无法查找下一门", "warn");
-        finishAll();
+        log("当前课程没有分类信息, 尝试列表页兜底", "warn");
+        await switchToNextCourseViaListPage();
         return;
       }
 
       // 3. 获取同分类下的所有课程列表
-      const listResp = await fetch(
-        `https://gateway.shengshengketang.com/api/course/online/schoolandcourse/selectListCourseByOc?limit=50&page=1&subClassifyId=${subClassifyId}`,
-        { headers: { "Content-Type": "application/json" } }
-      ).then(r => r.json());
+      let allCourses = null;
+      try {
+        const listResp = await apiGet(
+          `/api/course/online/schoolandcourse/selectListCourseByOc?limit=50&page=1&subClassifyId=${subClassifyId}`
+        );
+        if (listResp && listResp.code === 200 && listResp.data) {
+          allCourses = listResp.data.data || listResp.data;
+        } else if (listResp && listResp.data && listResp.data.code === 200) {
+          allCourses = listResp.data.data.data || listResp.data.data;
+        }
+      } catch (e) {
+        log(`课程列表请求异常: ${e.message}`, "error");
+      }
 
-      if (listResp.code !== 200 || !listResp.data || !listResp.data.data) {
-        log("获取课程列表失败", "error");
-        finishAll();
+      if (!allCourses || !Array.isArray(allCourses)) {
+        log("获取课程列表失败, 尝试列表页兜底", "warn");
+        await switchToNextCourseViaListPage();
         return;
       }
 
-      const allCourses = listResp.data.data;
       log(`同分类共 ${allCourses.length} 门课程`);
 
       // 4. 按 sort 排序, 找到当前课程之后第一个未完成的
@@ -704,7 +784,6 @@
       }
 
       if (!nextCourse) {
-        // 没有更高 sort 的未完成课程, 找任意未完成的
         nextCourse = sorted.find(c => c.id !== currid && c.finishPercentage < 100);
       }
 
@@ -714,35 +793,84 @@
         return;
       }
 
-      // 5. 跳转到下一门课程
-      log(`即将跳转到: ${nextCourse.name} (sort=${nextCourse.sort})`, "success");
-      STATE.totalCompleted = 0; // 重置当前课程计数
-      showNotification(`课程完成! 即将开始: ${nextCourse.name}`);
-
-      // 模拟网站的跳转方式:
-      // sessionStorage 设置新的 currid, 然后 router.push 到 videoDetail 页面
-      sessionStorage.setItem("currid", JSON.stringify(nextCourse.id));
-
-      // 尝试通过 Vue Router 跳转
-      const app = document.querySelector("#app");
-      if (app && app.__vue__ && app.__vue__.$router) {
-        app.__vue__.$router.push({ path: "/onlineStudent/videoDetail" });
-        // 网站源码在跳转后会 reload, 我们也这样做确保状态干净
-        setTimeout(() => {
-          STATE.switchingVideo = false;
-          STATE.lastEndedVideoSrc = null;
-          // 等页面加载完后, 新的脚本实例会自动启动
-          // 但因为是 SPA, 可能不会重新加载脚本, 所以等待新的 catalogue 加载后自动播放
-          waitForNewCourseLoaded();
-        }, 2000);
-      } else {
-        // 备选: 直接修改 URL
-        window.location.href = `https://www.shengshengketang.com/onlineStudent/videoDetail`;
-      }
+      // 5. 跳转
+      navigateToNextCourse(nextCourse);
 
     } catch (e) {
       log(`跳转下一门课程出错: ${e.message}`, "error");
       STATE.switchingVideo = false;
+    }
+  }
+
+  // 兜底方案: 跳到课程列表页, 让用户手动选 (或从列表页 DOM 找下一门)
+  async function switchToNextCourseViaListPage() {
+    log("使用列表页跳转方案...", "warn");
+
+    // 尝试用 selectListByClassifyId (不需要 subClassifyId)
+    try {
+      const resp = await apiGet(
+        `/api/course/curriculum/tourist/selectListByClassifyId?page=1&limit=50`
+      );
+      const courses = resp?.data?.data || resp?.data;
+      if (Array.isArray(courses) && courses.length > 0) {
+        const currid = JSON.parse(sessionStorage.getItem("currid"));
+        // 找当前课程在列表中的位置
+        const curIdx = courses.findIndex(c => c.id === currid);
+        log(`在推荐列表中找到 ${courses.length} 门课, 当前位置: ${curIdx}`);
+
+        // 找下一个未完成的
+        let nextCourse = null;
+        for (let i = curIdx + 1; i < courses.length; i++) {
+          if (courses[i].finishPercentage < 100) {
+            nextCourse = courses[i];
+            break;
+          }
+        }
+        if (!nextCourse) {
+          nextCourse = courses.find(c => c.id !== currid && c.finishPercentage < 100);
+        }
+
+        if (nextCourse) {
+          navigateToNextCourse(nextCourse);
+          return;
+        }
+      }
+    } catch (e) {
+      log(`列表页兜底也失败: ${e.message}`, "error");
+    }
+
+    finishAll();
+  }
+
+  // 执行跳转到下一门课程
+  function navigateToNextCourse(nextCourse) {
+    log(`即将跳转到: ${nextCourse.name} (sort=${nextCourse.sort})`, "success");
+    STATE.totalCompleted = 0;
+    showNotification(`课程完成! 即将开始: ${nextCourse.name}`);
+
+    // 写入 sessionStorage (网站自己的跳转方式)
+    sessionStorage.setItem("currid", JSON.stringify(nextCourse.id));
+
+    // 尝试 Vue Router
+    const app = document.querySelector("#app");
+    if (app && app.__vue__ && app.__vue__.$router) {
+      const router = app.__vue__.$router;
+      // 如果当前已经在 videoDetail 页面, 需要先跳走再跳回来 (同路由不会重新加载)
+      const currentPath = router.currentRoute?.path || '';
+      if (currentPath.includes('videoDetail')) {
+        // 同路由跳转: 直接 reload 最可靠
+        log("同页面跳转, 刷新页面加载新课程");
+        setTimeout(() => window.location.reload(), 500);
+      } else {
+        router.push({ path: "/onlineStudent/videoDetail" });
+        setTimeout(() => {
+          STATE.switchingVideo = false;
+          STATE.lastEndedVideoSrc = null;
+          waitForNewCourseLoaded();
+        }, 2000);
+      }
+    } else {
+      window.location.href = "https://www.shengshengketang.com/onlineStudent/videoDetail";
     }
   }
 
