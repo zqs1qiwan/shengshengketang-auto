@@ -21,7 +21,7 @@
   // ============ 配置 ============
   const CONFIG = {
     playbackRate: 3, // 默认播放速度
-    speedOptions: [1, 1.5, 3, 4, 5, 7.5], // 可选倍速
+    speedOptions: [1, 1.5, 3, 4, 5, 6, 7, 7.5], // 可选倍速
     autoAnswer: true, // 自动答题
     autoNext: true, // 自动切下一节
     autoMute: true, // 自动静音
